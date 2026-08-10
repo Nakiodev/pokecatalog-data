@@ -1,0 +1,72 @@
+name: build-catalog
+
+# Rigenera il bundle del catalogo e lo pubblica come asset della release "catalog".
+# Il tag e' fisso, quindi gli URL di download non cambiano mai:
+#   https://github.com/<owner>/<repo>/releases/download/catalog/manifest.json
+#   https://github.com/<owner>/<repo>/releases/download/catalog/catalog.json.gz
+on:
+  schedule:
+    # Ogni lunedi' alle 05:00 UTC. Le espansioni escono di rado, non serve di piu'.
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - build_catalog.py
+      - .github/workflows/build-catalog.yml
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout di questo repo
+        uses: actions/checkout@v4
+
+      - name: Checkout dei dati sorgente
+        uses: actions/checkout@v4
+        with:
+          repository: PokemonTCG/pokemon-tcg-data
+          ref: master
+          path: source
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Genera il bundle
+        run: python build_catalog.py --source source --output dist
+
+      - name: Confronta con la release pubblicata
+        id: diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          new_hash=$(python -c "import json;print(json.load(open('dist/manifest.json'))['contentHash'])")
+          old_hash=""
+          if gh release download catalog --pattern manifest.json --dir current 2>/dev/null; then
+            old_hash=$(python -c "import json;print(json.load(open('current/manifest.json'))['contentHash'])")
+          fi
+          if [ "$new_hash" = "$old_hash" ]; then
+            echo "Dati invariati (hash $new_hash), nessuna pubblicazione."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Dati cambiati: $old_hash -> $new_hash"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pubblica gli asset
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! gh release view catalog >/dev/null 2>&1; then
+            gh release create catalog \
+              --title "Catalogo carte" \
+              --notes "Bundle rigenerato automaticamente da build-catalog. Il tag resta 'catalog' cosi' gli URL di download sono stabili."
+          fi
+          gh release upload catalog dist/catalog.json.gz dist/manifest.json --clobber
