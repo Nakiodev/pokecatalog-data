@@ -1,0 +1,139 @@
+name: inspect-tcgdex
+
+# Workflow USA-E-GETTA. Serve solo a guardare cosa c'e' dentro l'immagine
+# ufficiale di TCGdex (tcgdex/server), per decidere se il catalogo puo' essere
+# generato da li' invece che da PokemonTCG/pokemon-tcg-data.
+#
+# Non genera bundle, non tocca la release "catalog", non pubblica niente:
+# scrive solo nel log e in un artifact temporaneo. Da cancellare dopo l'uso.
+#
+# Domande a cui deve rispondere:
+#   1. dove sta, dentro l'immagine, l'albero JSON prodotto da `bun run compile`
+#   2. com'e' organizzato (un file per endpoint? set e carte separati?)
+#   3. le carte hanno i campi `rarity` e `category`, che l'API pubblica non da'
+#   4. c'e' il set `mep` (MEP Black Star Promos), il motivo per cui siamo qui
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "Immagine da ispezionare"
+        default: "tcgdex/server:edge"
+      lang:
+        description: "Lingua da campionare"
+        default: "en"
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Scarica l'immagine
+        env:
+          IMAGE: ${{ inputs.image }}
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE"
+          echo "== digest =="
+          docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE"
+          echo "== dimensione =="
+          docker image inspect --format '{{.Size}}' "$IMAGE"
+
+      # Estraiamo il filesystem con `docker export` invece di entrare nel
+      # container: cosi' non serve che l'immagine contenga una shell e non
+      # dobbiamo indovinare in anticipo il percorso della cartella.
+      - name: Esporta il filesystem e cerca l'albero generato
+        env:
+          IMAGE: ${{ inputs.image }}
+        run: |
+          set -euo pipefail
+          cid=$(docker create "$IMAGE")
+          docker export "$cid" -o image.tar
+          docker rm "$cid" >/dev/null
+
+          echo "== cartelle chiamate 'generated' =="
+          tar -tf image.tar | grep -E '(^|/)generated/$' || echo "(nessuna)"
+
+          echo "== primi 40 file .json nell'immagine =="
+          tar -tf image.tar | grep -E '\.json$' | head -n 40
+
+      - name: Estrai l'albero e mostrane la forma
+        env:
+          LANG_CODE: ${{ inputs.lang }}
+        run: |
+          set -euo pipefail
+          root=$(tar -tf image.tar | grep -E '(^|/)generated/$' | head -n 1 || true)
+          if [ -z "$root" ]; then
+            echo "Nessuna cartella 'generated': i dati NON sono precompilati"
+            echo "dentro l'immagine. La strada B non funziona cosi' com'e'."
+            exit 1
+          fi
+          echo "root=$root" >> "$GITHUB_ENV"
+          echo "Trovata in: $root"
+
+          tar -xf image.tar --wildcards "${root}*"
+
+          echo "== struttura (2 livelli) =="
+          find "$root" -maxdepth 2 | head -n 60
+
+          echo "== peso totale e per lingua =="
+          du -sh "$root"
+          du -sh "$root"/* 2>/dev/null | head -n 20
+
+          echo "== contenuto di $LANG_CODE =="
+          ls -la "$root/$LANG_CODE" | head -n 40
+          echo "-- sottocartelle e quanti file contengono --"
+          find "$root/$LANG_CODE" -maxdepth 1 -type d | while read -r d; do
+            echo "$(find "$d" -type f | wc -l)	$d"
+          done
+
+      - name: Campiona i file e verifica i campi che ci servono
+        env:
+          LANG_CODE: ${{ inputs.lang }}
+        run: |
+          set -euo pipefail
+          lang="$root/$LANG_CODE"
+          mkdir -p samples
+
+          echo "== i 10 file piu' grandi (probabilmente gli indici) =="
+          find "$lang" -type f -name '*.json' -printf '%s\t%p\n' \
+            | sort -rn | head -n 10
+
+          echo "== inizio dei file di primo livello =="
+          for f in "$lang"/*.json; do
+            [ -e "$f" ] || continue
+            echo "--- $f ($(stat -c%s "$f") byte)"
+            head -c 500 "$f"; echo; echo
+            cp "$f" "samples/$(basename "$f")" 2>/dev/null || true
+          done
+
+          echo "== il set mep esiste? =="
+          find "$root" -path '*mep*' | head -n 20 || echo "(niente mep)"
+
+          echo "== una carta completa, per vedere i campi =="
+          card=$(find "$lang" -type f -path '*card*' -name '*mep*' | head -n 1 || true)
+          if [ -z "$card" ]; then
+            card=$(find "$lang" -type f -path '*card*' -name '*.json' | head -n 1 || true)
+          fi
+          if [ -n "$card" ]; then
+            echo "file: $card"
+            head -c 1500 "$card"; echo
+            cp "$card" samples/carta-esempio.json
+          else
+            echo "(nessun file di carta singola: le carte staranno dentro un indice)"
+          fi
+
+          echo "== presenza dei campi critici in tutto l'albero della lingua =="
+          for campo in rarity category localId variants image illustrator; do
+            n=$(grep -rlF "\"$campo\"" "$lang" 2>/dev/null | wc -l)
+            echo "$campo: presente in $n file"
+          done
+
+          # L'elenco completo dei file va nell'artifact: nel log sarebbe illeggibile.
+          find "$root" -type f | sort > samples/albero-completo.txt
+          wc -l samples/albero-completo.txt
+
+      - name: Carica i campioni
+        uses: actions/upload-artifact@v4
+        with:
+          name: tcgdex-samples
+          path: samples/
+          retention-days: 7
