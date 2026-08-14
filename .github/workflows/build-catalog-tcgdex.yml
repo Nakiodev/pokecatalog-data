@@ -1,0 +1,120 @@
+name: build-catalog-tcgdex
+
+# Gemello di build-catalog.yml, ma con i dati di TCGdex e su un tag SEPARATO.
+# Finche' resta cosi', la release "catalog" che l'app usa davvero non viene
+# toccata: si puo' generare, scaricare e confrontare il bundle nuovo senza
+# rischiare di rompere le installazioni esistenti.
+#
+#   https://github.com/<owner>/<repo>/releases/download/catalog-tcgdex/manifest.json
+#   https://github.com/<owner>/<repo>/releases/download/catalog-tcgdex/catalog.json.gz
+#
+# Quando il bundle nuovo convince, il passaggio definitivo e' cambiare TAG qui
+# e in CatalogConfig.kt (e togliere il workflow vecchio).
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "Immagine TCGdex da cui prendere i dati"
+        default: "tcgdex/server:edge"
+      lang:
+        description: "Lingua del catalogo"
+        default: "en"
+  schedule:
+    # Ogni lunedi' alle 05:30 UTC, mezz'ora dopo il workflow storico cosi' i
+    # due non si contendono il runner.
+    - cron: "30 5 * * 1"
+
+permissions:
+  contents: write
+
+env:
+  TAG: catalog-tcgdex
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout di questo repo
+        uses: actions/checkout@v4
+
+      # I dati sono gia' compilati dentro l'immagine (il loro build.yml esegue
+      # `bun run compile` prima del docker build), quindi non serve avviare il
+      # server ne' interrogare l'API pubblica: si estrae la cartella e basta.
+      - name: Estrai i dati da TCGdex
+        env:
+          IMAGE: ${{ inputs.image || 'tcgdex/server:edge' }}
+          LANG_CODE: ${{ inputs.lang || 'en' }}
+        run: |
+          set -eu
+          docker pull "$IMAGE"
+          echo "digest: $(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE")"
+
+          cid=$(docker create "$IMAGE")
+          docker export "$cid" -o image.tar
+          docker rm "$cid" >/dev/null
+
+          # Percorso noto ma non garantito dal progetto TCGdex: se un giorno lo
+          # spostano vogliamo un errore chiaro qui, non un bundle vuoto pubblicato.
+          tar -tf image.tar > listing.txt
+          root=$(grep -E '(^|/)generated/$' listing.txt | head -n 1)
+          if [ -z "$root" ]; then
+            echo "::error::Nessuna cartella 'generated' nell'immagine $IMAGE."
+            echo "::error::I dati non sono piu' precompilati: serve il fallback"
+            echo "::error::con checkout di tcgdex/cards-database e 'bun run compile'."
+            exit 1
+          fi
+          root="${root%/}"
+
+          tar -xf image.tar --wildcards "$root/$LANG_CODE/*"
+          mkdir -p source
+          cp "$root/$LANG_CODE/sets.json" "$root/$LANG_CODE/cards.json" source/
+          rm -f image.tar
+          ls -la source
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # --fill-images cerca sul CDN le immagini che i dati non dichiarano: sono
+      # ~1.700 richieste HEAD, un paio di minuti. Senza, quelle carte restano
+      # senza anteprima anche quando il file esiste.
+      - name: Genera il bundle
+        env:
+          LANG_CODE: ${{ inputs.lang || 'en' }}
+        run: |
+          python build_catalog_tcgdex.py \
+            --source source --output dist \
+            --lang "$LANG_CODE" --fill-images
+
+      - name: Confronta con la release pubblicata
+        id: diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          new_hash=$(python -c "import json;print(json.load(open('dist/manifest.json'))['contentHash'])")
+          old_hash=""
+          if gh release download "$TAG" --pattern manifest.json --dir current 2>/dev/null; then
+            old_hash=$(python -c "import json;print(json.load(open('current/manifest.json'))['contentHash'])")
+          fi
+          if [ "$new_hash" = "$old_hash" ]; then
+            echo "Dati invariati (hash $new_hash), nessuna pubblicazione."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Dati cambiati: $old_hash -> $new_hash"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pubblica gli asset
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --title "Catalogo carte (TCGdex, in prova)" \
+              --prerelease \
+              --notes "Bundle generato da build-catalog-tcgdex a partire dai dati TCGdex. Tag separato da 'catalog': serve a confrontare le due sorgenti prima di passare l'app alla nuova."
+          fi
+          gh release upload "$TAG" dist/catalog.json.gz dist/manifest.json --clobber
