@@ -1,17 +1,21 @@
 name: inspect-tcgdex
 
-# Workflow USA-E-GETTA. Serve solo a guardare cosa c'e' dentro l'immagine
-# ufficiale di TCGdex (tcgdex/server), per decidere se il catalogo puo' essere
-# generato da li' invece che da PokemonTCG/pokemon-tcg-data.
+# Workflow USA-E-GETTA. Guarda cosa c'e' dentro l'immagine ufficiale di TCGdex
+# (tcgdex/server) per decidere se il catalogo puo' essere generato da li'
+# invece che da PokemonTCG/pokemon-tcg-data.
 #
 # Non genera bundle, non tocca la release "catalog", non pubblica niente:
 # scrive solo nel log e in un artifact temporaneo. Da cancellare dopo l'uso.
 #
-# Domande a cui deve rispondere:
-#   1. dove sta, dentro l'immagine, l'albero JSON prodotto da `bun run compile`
-#   2. com'e' organizzato (un file per endpoint? set e carte separati?)
-#   3. le carte hanno i campi `rarity` e `category`, che l'API pubblica non da'
-#   4. c'e' il set `mep` (MEP Black Star Promos), il motivo per cui siamo qui
+# Dal primo run sappiamo gia' che l'albero compilato sta in
+#   usr/src/app/generated/<lingua>/{cards,sets,series,stats}.json
+# quindi qui non si esplora piu': si va dritti a rispondere alle due domande
+# rimaste, cioe' se cards.json contiene le carte COMPLETE (con `rarity` e
+# `category`, che l'API pubblica non espone nelle liste) e se c'e' il set `mep`.
+#
+# Nota: niente `pipefail` in questi step. Le pipe che finiscono in `head`
+# ricevono SIGPIPE per costruzione, e con pipefail un output troncato di
+# proposito verrebbe letto come errore (era il motivo del run rosso).
 on:
   workflow_dispatch:
     inputs:
@@ -30,106 +34,86 @@ jobs:
         env:
           IMAGE: ${{ inputs.image }}
         run: |
-          set -euo pipefail
+          set -eu
           docker pull "$IMAGE"
-          echo "== digest =="
+          echo "== digest (da pinnare se adottiamo questa strada) =="
           docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE"
-          echo "== dimensione =="
-          docker image inspect --format '{{.Size}}' "$IMAGE"
 
-      # Estraiamo il filesystem con `docker export` invece di entrare nel
-      # container: cosi' non serve che l'immagine contenga una shell e non
-      # dobbiamo indovinare in anticipo il percorso della cartella.
-      - name: Esporta il filesystem e cerca l'albero generato
+      # `docker export` invece di entrare nel container: non serve che
+      # l'immagine contenga una shell.
+      - name: Estrai l'albero generato
         env:
           IMAGE: ${{ inputs.image }}
+          LANG_CODE: ${{ inputs.lang }}
         run: |
-          set -euo pipefail
+          set -eu
           cid=$(docker create "$IMAGE")
           docker export "$cid" -o image.tar
           docker rm "$cid" >/dev/null
 
-          echo "== cartelle chiamate 'generated' =="
-          tar -tf image.tar | grep -E '(^|/)generated/$' || echo "(nessuna)"
+          # Il listato va su file: cosi' grep/head lavorano su un file e non
+          # su una pipe che qualcuno chiude in anticipo.
+          tar -tf image.tar > listing.txt
+          echo "== file dentro generated/ =="
+          grep -E 'generated/.*\.json$' listing.txt | head -n 60
 
-          echo "== primi 40 file .json nell'immagine =="
-          tar -tf image.tar | grep -E '\.json$' | head -n 40
-
-      - name: Estrai l'albero e mostrane la forma
-        env:
-          LANG_CODE: ${{ inputs.lang }}
-        run: |
-          set -euo pipefail
-          root=$(tar -tf image.tar | grep -E '(^|/)generated/$' | head -n 1 || true)
+          root=$(grep -E '(^|/)generated/$' listing.txt | head -n 1)
           if [ -z "$root" ]; then
             echo "Nessuna cartella 'generated': i dati NON sono precompilati"
-            echo "dentro l'immagine. La strada B non funziona cosi' com'e'."
+            echo "nell'immagine. Si va sul fallback: bun run compile da checkout."
             exit 1
           fi
-          echo "root=$root" >> "$GITHUB_ENV"
-          echo "Trovata in: $root"
+          root="${root%/}"
+          echo "ROOT=$root" >> "$GITHUB_ENV"
 
-          tar -xf image.tar --wildcards "${root}*"
+          tar -xf image.tar --wildcards "$root/$LANG_CODE/*"
+          echo "== dimensione dei file estratti =="
+          ls -la "$root/$LANG_CODE"
 
-          echo "== struttura (2 livelli) =="
-          find "$root" -maxdepth 2 | head -n 60
-
-          echo "== peso totale e per lingua =="
-          du -sh "$root"
-          du -sh "$root"/* 2>/dev/null | head -n 20
-
-          echo "== contenuto di $LANG_CODE =="
-          ls -la "$root/$LANG_CODE" | head -n 40
-          echo "-- sottocartelle e quanti file contengono --"
-          find "$root/$LANG_CODE" -maxdepth 1 -type d | while read -r d; do
-            echo "$(find "$d" -type f | wc -l)	$d"
-          done
-
-      - name: Campiona i file e verifica i campi che ci servono
+      - name: Rispondi alle domande aperte
         env:
           LANG_CODE: ${{ inputs.lang }}
         run: |
-          set -euo pipefail
-          lang="$root/$LANG_CODE"
+          set -eu
           mkdir -p samples
+          python3 - <<'PY'
+          import collections, json, os
 
-          echo "== i 10 file piu' grandi (probabilmente gli indici) =="
-          find "$lang" -type f -name '*.json' -printf '%s\t%p\n' \
-            | sort -rn | head -n 10
+          base = os.path.join(os.environ["ROOT"], os.environ["LANG_CODE"])
+          load = lambda n: json.load(open(os.path.join(base, n), encoding="utf-8"))
+          dump = lambda o: json.dumps(o, ensure_ascii=False, indent=2)
 
-          echo "== inizio dei file di primo livello =="
-          for f in "$lang"/*.json; do
-            [ -e "$f" ] || continue
-            echo "--- $f ($(stat -c%s "$f") byte)"
-            head -c 500 "$f"; echo; echo
-            cp "$f" "samples/$(basename "$f")" 2>/dev/null || true
-          done
+          sets = load("sets.json")
+          print(f"== SET: {len(sets)} ==")
+          print("chiavi del primo set:", sorted(sets[0]))
+          mep = next((s for s in sets if s.get("id") == "mep"), None)
+          print("\n== il set mep ==")
+          print(dump(mep) if mep else "ASSENTE")
 
-          echo "== il set mep esiste? =="
-          find "$root" -path '*mep*' | head -n 20 || echo "(niente mep)"
+          cards = load("cards.json")
+          print(f"\n== CARTE: {len(cards)} ==")
 
-          echo "== una carta completa, per vedere i campi =="
-          card=$(find "$lang" -type f -path '*card*' -name '*mep*' | head -n 1 || true)
-          if [ -z "$card" ]; then
-            card=$(find "$lang" -type f -path '*card*' -name '*.json' | head -n 1 || true)
-          fi
-          if [ -n "$card" ]; then
-            echo "file: $card"
-            head -c 1500 "$card"; echo
-            cp "$card" samples/carta-esempio.json
-          else
-            echo "(nessun file di carta singola: le carte staranno dentro un indice)"
-          fi
+          # La domanda vera: quali campi ci sono davvero, e su quante carte.
+          # Se `rarity`/`category` mancano, cards.json e' solo un indice
+          # "brief" e questa strada non basta.
+          freq = collections.Counter(k for c in cards for k in c)
+          print("\n== campi presenti (campo: su quante carte) ==")
+          for k, n in freq.most_common():
+              print(f"  {k}: {n}")
 
-          echo "== presenza dei campi critici in tutto l'albero della lingua =="
-          for campo in rarity category localId variants image illustrator; do
-            n=$(grep -rlF "\"$campo\"" "$lang" 2>/dev/null | wc -l)
-            echo "$campo: presente in $n file"
-          done
+          print("\n== una carta qualsiasi ==")
+          print(dump(cards[0]))
 
-          # L'elenco completo dei file va nell'artifact: nel log sarebbe illeggibile.
-          find "$root" -type f | sort > samples/albero-completo.txt
-          wc -l samples/albero-completo.txt
+          mep_cards = [c for c in cards if str(c.get("id", "")).startswith("mep-")]
+          print(f"\n== carte del set mep: {len(mep_cards)} ==")
+          if mep_cards:
+              print(dump(mep_cards[0]))
+
+          # Campioni leggeri per l'artifact: cards.json intero sarebbe enorme.
+          json.dump(cards[:50], open("samples/cards-primi-50.json", "w"), ensure_ascii=False, indent=2)
+          json.dump(mep_cards, open("samples/cards-mep.json", "w"), ensure_ascii=False, indent=2)
+          json.dump(sets, open("samples/sets.json", "w"), ensure_ascii=False, indent=2)
+          PY
 
       - name: Carica i campioni
         uses: actions/upload-artifact@v4
