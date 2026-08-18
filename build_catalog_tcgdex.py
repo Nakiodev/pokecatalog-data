@@ -16,8 +16,19 @@ Nota: `sets.json` contiene anche un elenco delle carte, ma ridotto ai soli
 id/localId/nome. Le carte le leggiamo quindi da `cards.json`, che e' l'unico
 posto dove ci sono `rarity` e `category`.
 
+Ogni lingua produce un catalogo suo, che sulla release convive con gli altri:
+
+    --lang en   ->  catalog.json.gz     + manifest.json
+    --lang ja   ->  catalog-ja.json.gz  + manifest-ja.json
+
+Non sono traduzioni l'uno dell'altro: le carte giapponesi escono in espansioni
+loro e numerate a modo loro, quindi sono cataloghi distinti anche come dati.
+L'inglese tiene i nomi senza suffisso perche' sono quelli che le versioni
+dell'app gia' installate vanno a cercare.
+
 Uso:
     python build_catalog_tcgdex.py --source ./source --output ./dist
+    python build_catalog_tcgdex.py --source ./source/ja --output ./dist --lang ja
 """
 
 from __future__ import annotations
@@ -40,6 +51,11 @@ from pathlib import Path
 # arriva dai quattro campi in piu' per il riconoscimento (vedi slim_card), la 3
 # dai tipi della carta (Fuoco, Acqua...), che servono alle statistiche.
 SCHEMA_VERSION = 3
+
+# La lingua che tiene i nomi storici degli asset ("catalog.json.gz",
+# "manifest.json"). Tutte le altre prendono un suffisso, cosi' i cataloghi
+# convivono sulla stessa release senza sovrascriversi.
+DEFAULT_LANG = "en"
 
 # TCGdex pubblica le immagini senza estensione: qualita' ed estensione si
 # scelgono appendendole al path (".../mep/001" -> ".../mep/001/high.png").
@@ -337,7 +353,12 @@ def build(
     content_hash = hashlib.sha256(payload).hexdigest()
 
     output.mkdir(parents=True, exist_ok=True)
-    bundle_path = output / "catalog.json.gz"
+    # I cataloghi pubblicati sono uno per lingua e stanno sulla stessa release,
+    # quindi il nome dell'asset deve dire di quale si tratta. L'inglese conserva
+    # il nome storico senza suffisso: e' l'asset che cercano le installazioni
+    # gia' in giro, e rinominarlo vorrebbe dire lasciarle senza catalogo.
+    suffix = "" if lang == DEFAULT_LANG else f"-{lang}"
+    bundle_path = output / f"catalog{suffix}.json.gz"
     # mtime=0 e filename vuoto: due esecuzioni con gli stessi dati producono lo
     # stesso .gz byte per byte (gzip normalmente ci scrive dentro data e nome).
     with bundle_path.open("wb") as raw_out:
@@ -347,6 +368,11 @@ def build(
     bundle_bytes = bundle_path.stat().st_size
     manifest = {
         "schema": SCHEMA_VERSION,
+        # La lingua dei dati. L'app la controlla prima di importare: un catalogo
+        # giapponese finito nel database occidentale non somiglierebbe a un
+        # errore ma a un riconoscimento impazzito, che propone carte plausibili e
+        # sbagliate. Meglio accorgersene qui.
+        "lang": lang,
         "generatedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "contentHash": content_hash,
         "sets": len(sets),
@@ -355,7 +381,7 @@ def build(
         "bundleBytes": bundle_bytes,
         "bundleSha256": hashlib.sha256(bundle_path.read_bytes()).hexdigest(),
     }
-    (output / "manifest.json").write_text(
+    (output / f"manifest{suffix}.json").write_text(
         json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
     )
 
@@ -385,6 +411,22 @@ def build(
     # qui perche' un crollo si veda al run, non a valle.
     con_tipo = sum(1 for c in cards if c["types"])
     print(f"carte con almeno un tipo: {con_tipo} ({con_tipo * 100 / totale:.0f}%)")
+
+    # Tutte le rarita' che compaiono, con quante carte ciascuna.
+    #
+    # L'app le traduce, le colora e le ordina con una tabella scritta a mano
+    # (Rarities.kt), e per un catalogo in un'altra lingua quella tabella si puo'
+    # compilare solo sapendo *quali stringhe* la sorgente usa davvero. Stamparle
+    # qui vuol dire che il log di un run e' anche l'elenco delle voci da
+    # aggiungere: quelle che non compaiono nella tabella non rompono niente, ma
+    # si leggono cosi' come sono e finiscono d'ufficio fra le rare.
+    rarita: dict[str, int] = {}
+    for c in cards:
+        chiave = c["rarity"] or "(senza rarita')"
+        rarita[chiave] = rarita.get(chiave, 0) + 1
+    print("rarita' presenti: " + ", ".join(
+        f"{nome} ({n})" for nome, n in sorted(rarita.items(), key=lambda kv: -kv[1])
+    ))
 
     # Le carte senza immagine, raggruppate per set: e' la lista da cui partire
     # se un giorno si vogliono tappare i buchi (vedi README).
