@@ -1,0 +1,290 @@
+name: inspect-tcgdex
+
+# Workflow USA-E-GETTA. Guarda cosa c'e' dentro l'immagine ufficiale di TCGdex
+# (tcgdex/server) per decidere cosa possiamo ricavarne.
+#
+# Non genera bundle, non tocca nessuna release, non pubblica niente: scrive solo
+# nel log e in un artifact temporaneo. Da cancellare quando ha finito il suo
+# lavoro.
+#
+# Il primo giro rispose alle domande sul catalogo: l'albero compilato sta in
+#   usr/src/app/generated/<lingua>/{cards,sets,series,stats}.json
+# e cards.json contiene le carte COMPLETE (con `rarity` e `category`, che l'API
+# pubblica nelle liste non espone). Su quello e' costruita la pipeline.
+#
+# QUESTO giro serve a un'altra domanda: **i prezzi**. Sappiamo che l'API di
+# TCGdex serve `pricing.cardmarket` (euro, avg/low/trend, per singola variante),
+# ma che quel campo non e' nel dump compilato: lo aggiunge il server quando
+# risponde. Prima di progettare qualsiasi cosa servono quattro risposte:
+#
+#   1. dentro l'immagine c'e' un file di prezzi?
+#   2. il server, avviato in locale, risponde con `pricing`?
+#   3. lo fa anche SENZA RETE, cioe' i prezzi sono suoi o li va a chiedere?
+#   4. quante carte ne hanno davvero, in inglese e in giapponese?
+#
+# La terza e' quella che decide tutto: se i prezzi sono dentro l'immagine, per
+# averli basta avviare il container dentro questa Action e interrogarlo, senza
+# fare 23.000 richieste al loro server pubblico. Se invece li chiede a qualcun
+# altro, ogni aggiornamento e' traffico su un'infrastruttura che non e' nostra, e
+# va chiesto il permesso prima di scrivere una riga di codice.
+#
+# Nota: niente `pipefail` in questi step. Le pipe che finiscono in `head`
+# ricevono SIGPIPE per costruzione, e con pipefail un output troncato di
+# proposito verrebbe letto come errore (era il motivo del run rosso).
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "Immagine da ispezionare"
+        default: "tcgdex/server:edge"
+      langs:
+        description: "Lingue da campionare, separate da spazio"
+        default: "en ja"
+
+env:
+  IMAGE: ${{ inputs.image || 'tcgdex/server:edge' }}
+  LANGS: ${{ inputs.langs || 'en ja' }}
+  # Quante carte per lingua si interrogano per stimare la copertura dei prezzi.
+  # E' un campione, non un censimento: chiederle tutte sarebbe esattamente il
+  # traffico che stiamo cercando di evitare.
+  SAMPLE: "20"
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Scarica le immagini
+        run: |
+          set -eu
+          docker pull "$IMAGE"
+          echo "== digest (da pinnare se adottiamo questa strada) =="
+          docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE"
+          # Serve piu' avanti per interrogare il server da dentro una rete
+          # isolata, dove il runner non arriva. Si scarica adesso, finche' la
+          # rete c'e'.
+          docker pull curlimages/curl:latest
+
+      # `docker export` invece di entrare nel container: non serve che
+      # l'immagine contenga una shell.
+      - name: Estrai l'albero generato
+        run: |
+          set -eu
+          cid=$(docker create "$IMAGE")
+          docker export "$cid" -o image.tar
+          docker rm "$cid" >/dev/null
+
+          # Il listato va su file: cosi' grep/head lavorano su un file e non
+          # su una pipe che qualcuno chiude in anticipo.
+          tar -tf image.tar > listing.txt
+          root=$(grep -E '(^|/)generated/$' listing.txt | head -n 1)
+          if [ -z "$root" ]; then
+            echo "::error::Nessuna cartella 'generated' nell'immagine $IMAGE."
+            exit 1
+          fi
+          root="${root%/}"
+          echo "ROOT=$root" >> "$GITHUB_ENV"
+
+          for lang in $LANGS; do
+            tar -xf image.tar --wildcards "$root/$lang/*"
+            echo "== file di $lang =="
+            ls -la "$root/$lang"
+          done
+
+      # DOMANDA 1: c'e' un file di prezzi dentro l'immagine?
+      #
+      # Si guarda in due modi, perche' uno solo mente facilmente: il nome dei
+      # file (un `pricing.json` si riconoscerebbe subito) e il contenuto di
+      # quelli che gia' estraiamo (se `pricing` comparisse dentro cards.json,
+      # tutto il resto di questo workflow sarebbe inutile e avremmo finito).
+      - name: I prezzi sono dentro l'immagine?
+        run: |
+          set -eu
+          echo "== file col nome sospetto =="
+          # In un `grep | head` l'esito e' quello di head, cioe' sempre zero: per
+          # distinguere "nessun file" da "nessun output" il filtro va fatto
+          # prima, su un file suo.
+          if grep -iE 'pric|cardmarket|tcgplayer|quotation|market' listing.txt > sospetti.txt; then
+            head -n 40 sospetti.txt
+          else
+            echo "  nessuno"
+          fi
+
+          for lang in $LANGS; do
+            cards="$ROOT/$lang/cards.json"
+            [ -f "$cards" ] || continue
+            echo "== $lang: occorrenze dentro cards.json =="
+            for needle in pricing cardmarket tcgplayer; do
+              n=$(grep -o "\"$needle\"" "$cards" | wc -l || true)
+              echo "  \"$needle\": $n"
+            done
+          done
+
+      # DOMANDA 4 (prima parte): che campi hanno davvero le carte, per lingua.
+      # E' lo stesso conteggio del primo giro, ma ora su piu' lingue: serve a
+      # sapere se il catalogo giapponese e' completo quanto l'altro.
+      - name: Campi presenti, per lingua
+        run: |
+          set -eu
+          mkdir -p samples
+          python3 - <<'PY'
+          import collections, json, os
+
+          root = os.environ["ROOT"]
+          langs = os.environ["LANGS"].split()
+          scelte = {}
+
+          for lang in langs:
+              base = os.path.join(root, lang)
+              with open(os.path.join(base, "cards.json"), encoding="utf-8") as f:
+                  cards = json.load(f)
+              print(f"\n== {lang}: {len(cards)} carte ==")
+              freq = collections.Counter(k for c in cards for k in c)
+              for k, n in freq.most_common():
+                  print(f"  {k}: {n} ({n * 100 // max(len(cards), 1)}%)")
+
+              # Le carte da interrogare dopo: si prendono dalle serie recenti,
+              # che sono quelle che un prezzo ce l'hanno di sicuro. Se non se ne
+              # riconoscono, si ripiega sulle prime che capitano.
+              recenti = [c["id"] for c in cards if str(c.get("id", "")).startswith(("sv", "me"))]
+              scelte[lang] = (recenti or [c["id"] for c in cards])[: int(os.environ["SAMPLE"])]
+              print(f"  campione per le richieste: {len(scelte[lang])} carte")
+
+              with open(f"samples/cards-{lang}-primi-50.json", "w", encoding="utf-8") as f:
+                  json.dump(cards[:50], f, ensure_ascii=False, indent=2)
+
+          with open("samples/campione-id.json", "w", encoding="utf-8") as f:
+              json.dump(scelte, f, ensure_ascii=False, indent=2)
+          PY
+
+      # DOMANDE 2 e 4: avviato il server, risponde con i prezzi? e per quante
+      # carte?
+      #
+      # Se il container non parte non e' un fallimento del workflow ma una
+      # risposta: vuol dire che quella strada richiede piu' di un `docker run`
+      # (una configurazione, un database), e va saputo adesso. Per questo il log
+      # del container si stampa comunque.
+      - name: Il server risponde con i prezzi? (con rete)
+        run: |
+          set -eu
+          port=$(docker image inspect --format '{{json .Config.ExposedPorts}}' "$IMAGE" \
+            | tr -d '{}"' | tr ',' '\n' | head -n 1 | cut -d/ -f1)
+          port=${port:-3000}
+          echo "porta esposta dall'immagine: $port"
+          echo "PORT=$port" >> "$GITHUB_ENV"
+
+          docker rm -f tcgdex >/dev/null 2>&1 || true
+          docker run -d --name tcgdex -p 3000:"$port" "$IMAGE" >/dev/null
+
+          pronto=""
+          for _ in $(seq 1 30); do
+            if curl -fsS "http://localhost:3000/v2/en/sets" -o /dev/null 2>/dev/null; then
+              pronto="si"
+              break
+            fi
+            sleep 2
+          done
+
+          echo "== log del container =="
+          docker logs tcgdex 2>&1 | tail -n 30 || true
+
+          if [ -z "$pronto" ]; then
+            echo "::warning::Il server non risponde su /v2/en/sets: la strada"
+            echo "::warning::'avvia il container e interrogalo' richiede altro."
+            exit 0
+          fi
+
+          python3 - <<'PY'
+          import json, os, urllib.request
+
+          scelte = json.load(open("samples/campione-id.json", encoding="utf-8"))
+          risultati = {}
+
+          for lang, ids in scelte.items():
+              con_prezzo = 0
+              primo = None
+              for card_id in ids:
+                  url = f"http://localhost:3000/v2/{lang}/cards/{card_id}"
+                  try:
+                      with urllib.request.urlopen(url, timeout=20) as r:
+                          carta = json.load(r)
+                  except Exception as e:
+                      print(f"  {lang}/{card_id}: richiesta fallita ({e})")
+                      continue
+                  pricing = carta.get("pricing")
+                  if pricing:
+                      con_prezzo += 1
+                      if primo is None:
+                          primo = {"id": card_id, "pricing": pricing}
+              totale = len(ids)
+              risultati[lang] = {"campione": totale, "con_prezzo": con_prezzo, "esempio": primo}
+              print(f"\n== {lang}: {con_prezzo} carte su {totale} hanno `pricing` ==")
+              if primo:
+                  print(json.dumps(primo, ensure_ascii=False, indent=2))
+              else:
+                  print("  nessun prezzo in questo campione")
+
+          json.dump(risultati, open("samples/prezzi.json", "w", encoding="utf-8"),
+                    ensure_ascii=False, indent=2)
+          PY
+
+          docker rm -f tcgdex >/dev/null
+
+      # DOMANDA 3, quella che decide tutto: i prezzi sono dentro l'immagine o il
+      # server li va a chiedere a qualcun altro?
+      #
+      # Il container gira su una rete `--internal`, che non ha uscita verso
+      # Internet, e lo si interroga da un secondo container attaccato alla stessa
+      # rete — dal runner non sarebbe raggiungibile. Se `pricing` c'e' lo stesso,
+      # i prezzi viaggiano dentro l'immagine e ci bastano un `docker run` e
+      # qualche richiesta in locale. Se sparisce, ogni aggiornamento e' traffico
+      # sull'infrastruttura di qualcun altro.
+      - name: Il server risponde con i prezzi anche senza rete?
+        run: |
+          set -eu
+          docker network rm isolata >/dev/null 2>&1 || true
+          docker network create --internal isolata >/dev/null
+
+          docker rm -f tcgdex-isolato >/dev/null 2>&1 || true
+          docker run -d --name tcgdex-isolato --network isolata "$IMAGE" >/dev/null
+          sleep 20
+
+          # La prima lingua che ha prodotto un campione, non per forza l'inglese:
+          # il workflow si puo' lanciare anche solo su una lingua.
+          card=$(python3 -c "import json;d=json.load(open('samples/campione-id.json'));print(next(i[0] for i in d.values() if i))")
+          echo "carta di prova: $card"
+
+          set +e
+          docker run --rm --network isolata curlimages/curl:latest \
+            -sS --max-time 30 "http://tcgdex-isolato:${PORT}/v2/en/cards/$card" > isolato.json
+          esito=$?
+          set -e
+
+          echo "== log del container isolato =="
+          docker logs tcgdex-isolato 2>&1 | tail -n 30 || true
+
+          if [ "$esito" -ne 0 ] || [ ! -s isolato.json ]; then
+            echo "::warning::Senza rete il server non ha risposto affatto: la"
+            echo "::warning::risposta a questa domanda non e' concludente."
+          else
+            echo "== risposta senza rete (primi 1500 caratteri) =="
+            head -c 1500 isolato.json
+            echo
+            if grep -q '"pricing"' isolato.json; then
+              echo "== VERDETTO: i prezzi sono DENTRO l'immagine =="
+            else
+              echo "== VERDETTO: senza rete il campo pricing non c'e' =="
+              echo "   quindi il server li chiede a qualcun altro."
+            fi
+            cp isolato.json samples/carta-senza-rete.json
+          fi
+
+          docker rm -f tcgdex-isolato >/dev/null
+          docker network rm isolata >/dev/null
+
+      - name: Carica i campioni
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tcgdex-samples
+          path: samples/
+          retention-days: 7
