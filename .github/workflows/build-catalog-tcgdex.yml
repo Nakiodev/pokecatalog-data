@@ -8,6 +8,16 @@ name: build-catalog-tcgdex
 #   https://github.com/<owner>/<repo>/releases/download/catalog-tcgdex/manifest.json
 #   https://github.com/<owner>/<repo>/releases/download/catalog-tcgdex/catalog.json.gz
 #
+# Sulla stessa release convivono i cataloghi di piu' lingue, uno per asset:
+# l'inglese senza suffisso (e' quello che le app gia' installate cercano), le
+# altre con il codice lingua in coda.
+#
+#   manifest-ja.json / catalog-ja.json.gz   ->  carte giapponesi
+#
+# Non sono traduzioni l'uno dell'altro: le carte giapponesi escono in espansioni
+# loro e numerate a modo loro, quindi l'app li tiene in due database separati e
+# scarica il secondo solo a chi lo chiede.
+#
 # Quando il bundle nuovo convince, il passaggio definitivo e' cambiare TAG qui
 # e in CatalogConfig.kt (e togliere il workflow vecchio).
 on:
@@ -16,9 +26,9 @@ on:
       image:
         description: "Immagine TCGdex da cui prendere i dati"
         default: "tcgdex/server:edge"
-      lang:
-        description: "Lingua del catalogo"
-        default: "en"
+      langs:
+        description: "Lingue da generare, separate da spazio"
+        default: "en ja"
   schedule:
     # Ogni lunedi' alle 05:30 UTC, mezz'ora dopo il workflow storico cosi' i
     # due non si contendono il runner.
@@ -29,6 +39,10 @@ permissions:
 
 env:
   TAG: catalog-tcgdex
+  # Tutte le lingue pubblicate: il giro settimanale le rigenera tutte, perche' un
+  # catalogo giapponese fermo a sei mesi fa e' un problema di chi lo ha scaricato
+  # esattamente quanto lo sarebbe quello occidentale.
+  LANGS: ${{ inputs.langs || 'en ja' }}
 
 jobs:
   build:
@@ -43,7 +57,6 @@ jobs:
       - name: Estrai i dati da TCGdex
         env:
           IMAGE: ${{ inputs.image || 'tcgdex/server:edge' }}
-          LANG_CODE: ${{ inputs.lang || 'en' }}
         run: |
           set -eu
           docker pull "$IMAGE"
@@ -65,56 +78,81 @@ jobs:
           fi
           root="${root%/}"
 
-          tar -xf image.tar --wildcards "$root/$LANG_CODE/*"
-          mkdir -p source
-          cp "$root/$LANG_CODE/sets.json" "$root/$LANG_CODE/cards.json" source/
+          # Ogni lingua nella sua cartella: i due file si chiamano uguale, e in
+          # una cartella sola il secondo cancellerebbe il primo.
+          for lang in $LANGS; do
+            if ! tar -xf image.tar --wildcards "$root/$lang/*"; then
+              echo "::error::Lingua '$lang' assente dall'immagine $IMAGE."
+              exit 1
+            fi
+            mkdir -p "source/$lang"
+            cp "$root/$lang/sets.json" "$root/$lang/cards.json" "source/$lang/"
+          done
           rm -f image.tar
-          ls -la source
+          ls -la source/*
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       # --fill-images cerca sul CDN le immagini che i dati non dichiarano: sono
-      # ~1.700 richieste HEAD, un paio di minuti. Senza, quelle carte restano
-      # senza anteprima anche quando il file esiste.
-      - name: Genera il bundle
-        env:
-          LANG_CODE: ${{ inputs.lang || 'en' }}
+      # ~1.700 richieste HEAD per lingua, un paio di minuti. Senza, quelle carte
+      # restano senza anteprima anche quando il file esiste.
+      - name: Genera i bundle
         run: |
-          python build_catalog_tcgdex.py \
-            --source source --output dist \
-            --lang "$LANG_CODE" --fill-images
+          set -eu
+          for lang in $LANGS; do
+            echo "::group::$lang"
+            python build_catalog_tcgdex.py \
+              --source "source/$lang" --output dist \
+              --lang "$lang" --fill-images
+            echo "::endgroup::"
+          done
+          ls -la dist
 
-      - name: Confronta con la release pubblicata
-        id: diff
+      # Il confronto e la pubblicazione sono per lingua: un catalogo puo' essere
+      # cambiato e l'altro no, e ripubblicare un asset identico vorrebbe dire
+      # far riscaricare decine di MB a chi ce l'ha gia' uguale.
+      - name: Pubblica gli asset cambiati
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          new_hash=$(python -c "import json;print(json.load(open('dist/manifest.json'))['contentHash'])")
-          old_hash=""
-          if gh release download "$TAG" --pattern manifest.json --dir current 2>/dev/null; then
-            old_hash=$(python -c "import json;print(json.load(open('current/manifest.json'))['contentHash'])")
-          fi
-          if [ "$new_hash" = "$old_hash" ]; then
-            echo "Dati invariati (hash $new_hash), nessuna pubblicazione."
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "Dati cambiati: $old_hash -> $new_hash"
-            echo "changed=true" >> "$GITHUB_OUTPUT"
+          hash_of() {
+            python -c "import json,sys;print(json.load(open(sys.argv[1]))['contentHash'])" "$1"
+          }
+
+          to_upload=""
+          for lang in $LANGS; do
+            if [ "$lang" = "en" ]; then suffix=""; else suffix="-$lang"; fi
+            manifest="manifest${suffix}.json"
+            bundle="catalog${suffix}.json.gz"
+
+            new_hash=$(hash_of "dist/$manifest")
+            old_hash=""
+            rm -rf current
+            if gh release download "$TAG" --pattern "$manifest" --dir current 2>/dev/null; then
+              old_hash=$(hash_of "current/$manifest")
+            fi
+
+            if [ "$new_hash" = "$old_hash" ]; then
+              echo "$lang: dati invariati (hash $new_hash), non si pubblica."
+            else
+              echo "$lang: dati cambiati ($old_hash -> $new_hash)."
+              to_upload="$to_upload dist/$bundle dist/$manifest"
+            fi
+          done
+
+          if [ -z "$to_upload" ]; then
+            echo "Niente da pubblicare."
+            exit 0
           fi
 
-      - name: Pubblica gli asset
-        if: steps.diff.outputs.changed == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" \
               --title "Catalogo carte (TCGdex, in prova)" \
               --prerelease \
               --notes "Bundle generato da build-catalog-tcgdex a partire dai dati TCGdex. Tag separato da 'catalog': serve a confrontare le due sorgenti prima di passare l'app alla nuova."
           fi
-          gh release upload "$TAG" dist/catalog.json.gz dist/manifest.json --clobber
+          # shellcheck disable=SC2086
+          gh release upload "$TAG" $to_upload --clobber
