@@ -239,6 +239,13 @@ def card_types(raw: dict) -> list[str] | None:
     return kept or None
 
 
+def printed_rarity(raw: str | None) -> str | None:
+    """La rarita' stampata, o None se la carta non ne ha una."""
+    if not raw or raw.strip().lower() == "none":
+        return None
+    return raw
+
+
 def slim_card(raw: dict) -> dict:
     small, large = card_images(raw.get("image"))
     hp = raw.get("hp")
@@ -250,7 +257,13 @@ def slim_card(raw: dict) -> dict:
         # "001" sulle promo, "136" nelle espansioni normali. Lo teniamo
         # letterale, la normalizzazione per il confronto OCR la fa l'app.
         "number": str(raw.get("localId") or ""),
-        "rarity": raw.get("rarity"),
+        # "None" non e' una rarita': e' la sorgente che dice che la carta non ne
+        # ha una stampata (energie base, promo senza simbolo). Sul catalogo
+        # giapponese sono duemila carte su dodicimila, e tenerlo per buono
+        # vorrebbe dire un nome di rarita' che non esiste su un sesto delle
+        # carte. Assente e' l'unica cosa vera, ed e' un caso che l'app gia'
+        # conosce: sono le stesse carte che qui hanno il campo vuoto.
+        "rarity": printed_rarity(raw.get("rarity")),
         # In TCGdex si chiama `category` e vale Pokemon/Trainer/Energy (senza
         # accento, a differenza di pokemontcg che scriveva "Pokémon").
         "supertype": raw.get("category"),
