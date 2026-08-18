@@ -37,8 +37,9 @@ from pathlib import Path
 # Versione dello schema del bundle. Va incrementata solo se cambia la FORMA dei
 # dati (campi aggiunti/rinominati): l'app rifiuta gli schemi che non conosce.
 # Passare a TCGdex di per se' cambia i VALORI (gli id), non la forma; la 2
-# arriva dai quattro campi in piu' per il riconoscimento (vedi slim_card).
-SCHEMA_VERSION = 2
+# arriva dai quattro campi in piu' per il riconoscimento (vedi slim_card), la 3
+# dai tipi della carta (Fuoco, Acqua...), che servono alle statistiche.
+SCHEMA_VERSION = 3
 
 # TCGdex pubblica le immagini senza estensione: qualita' ed estensione si
 # scelgono appendendole al path (".../mep/001" -> ".../mep/001/high.png").
@@ -77,6 +78,10 @@ def asset_url(base: str | None) -> str | None:
 # quindi possiamo ricostruirli e chiedere al CDN se esistono davvero. Si
 # ricostruisce solo cio' che manca, e si tiene solo cio' che risponde: mai
 # URL inventati nel bundle.
+# Nota: la serie "Pokemon TCG Pocket" (il gioco per cellulare) resta nel
+# catalogo anche se quelle carte non esistono su cartoncino. Si possono
+# consultare, semplicemente l'app le raggruppa in fondo: la scelta di dove
+# metterle e' della UI, non di chi genera i dati.
 CDN = "https://assets.tcgdex.net"
 USER_AGENT = "pokecatalog-build (+https://github.com/Nakiodev/pokecatalog-data)"
 
@@ -200,6 +205,24 @@ def slim_set(raw: dict) -> dict:
 #   illustrator     "Illus. <nome>" a fondo carta: molto discriminante fra
 #                   ristampe della stessa carta in set diversi
 #   stage           "Basic" / "Stage 1" / "Stage 2" sopra il nome
+#
+# `types` invece non serve al riconoscimento: e' il tipo del Pokemon (Fire,
+# Water, Grass...), quello del simbolo in alto a destra, e sta nel bundle perche'
+# le statistiche dell'app dividono la collezione per tipo. Le carte Allenatore ed
+# Energia non ce l'hanno, e li' l'app ripiega su `supertype`.
+def card_types(raw: dict) -> list[str] | None:
+    """I tipi della carta, o None per chi non ne ha (Allenatore, Energia).
+
+    Lista e non stringa perche' TCGdex la da' cosi' e qualche carta ne ha piu'
+    d'uno: chi legge decide cosa farne, il bundle non sceglie per lui.
+    """
+    types = raw.get("types")
+    if not isinstance(types, list):
+        return None
+    kept = [str(t) for t in types if t]
+    return kept or None
+
+
 def slim_card(raw: dict) -> dict:
     small, large = card_images(raw.get("image"))
     hp = raw.get("hp")
@@ -215,6 +238,7 @@ def slim_card(raw: dict) -> dict:
         # In TCGdex si chiama `category` e vale Pokemon/Trainer/Energy (senza
         # accento, a differenza di pokemontcg che scriveva "Pokémon").
         "supertype": raw.get("category"),
+        "types": card_types(raw),
         "img": small,
         "imgHi": large,
         "hp": int(hp) if isinstance(hp, (int, float)) else None,
@@ -356,6 +380,11 @@ def build(
         for campo in ("hp", "regulationMark", "illustrator", "stage")
     )
     print(f"copertura disambiguatori -> {coperture}")
+    # I tipi non disambiguano niente, ma se sparissero dalla sorgente le
+    # statistiche dell'app si svuoterebbero senza dirlo a nessuno: il conto sta
+    # qui perche' un crollo si veda al run, non a valle.
+    con_tipo = sum(1 for c in cards if c["types"])
+    print(f"carte con almeno un tipo: {con_tipo} ({con_tipo * 100 / totale:.0f}%)")
 
     # Le carte senza immagine, raggruppate per set: e' la lista da cui partire
     # se un giorno si vogliono tappare i buchi (vedi README).
