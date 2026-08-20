@@ -20,13 +20,25 @@ mai:
 ```
 https://github.com/<owner>/<repo>/releases/download/catalog-tcgdex/manifest.json
 https://github.com/<owner>/<repo>/releases/download/catalog-tcgdex/catalog.json.gz
+https://github.com/<owner>/<repo>/releases/download/catalog-tcgdex/manifest-ja.json
+https://github.com/<owner>/<repo>/releases/download/catalog-tcgdex/catalog-ja.json.gz
 ```
 
-L'app scarica prima `manifest.json`, che pesa poche centinaia di byte:
+I cataloghi sono **due**, non uno tradotto due volte: le carte giapponesi escono
+in espansioni loro e numerate a modo loro, quindi il `025/165` di una carta
+giapponese e quello di una occidentale sono due carte che non c'entrano niente
+l'una con l'altra. L'app li tiene in due database separati e scarica il
+giapponese solo a chi lo chiede, dall'interruttore Europa/Asia della scansione.
+
+L'inglese conserva i nomi senza suffisso perché sono quelli che cercano le
+versioni dell'app già installate; ogni altra lingua prende il suo codice in coda.
+
+L'app scarica prima il manifest, che pesa poche centinaia di byte:
 
 ```json
 {
   "schema": 3,
+  "lang": "en",
   "generatedAt": "2026-08-18T05:31:04Z",
   "contentHash": "…",
   "sets": 218,
@@ -36,6 +48,10 @@ L'app scarica prima `manifest.json`, che pesa poche centinaia di byte:
   "bundleSha256": "…"
 }
 ```
+
+`lang` dice di quale catalogo si tratta e l'app lo verifica prima di importare:
+un catalogo giapponese finito nel database occidentale non somiglierebbe a un
+errore ma a un riconoscimento impazzito, che propone carte plausibili e sbagliate.
 
 Se `contentHash` è uguale a quello già importato nel telefono, il bundle non
 viene nemmeno richiesto: un avvio a catalogo aggiornato costa una richiesta e
@@ -49,15 +65,20 @@ oppure a mano da **Actions → build-catalog-tcgdex → Run workflow**:
 
 1. scarica l'immagine Docker ufficiale `tcgdex/server` ed estrae con
    `docker export` la cartella `/usr/src/app/generated/<lingua>/`, dove TCGdex
-   tiene i suoi dati già compilati. Servono due file soli: `sets.json` e
-   `cards.json`. Nessuna richiesta all'API pubblica, nessuna toolchain Bun da
-   mantenere;
-2. lancia `build_catalog_tcgdex.py`, che tiene solo i campi utili, ricostruisce
-   le immagini mancanti (`--fill-images`) e scrive `dist/catalog.json.gz` +
-   `dist/manifest.json`;
-3. confronta il `contentHash` con quello della release già pubblicata: **se i
-   dati non sono cambiati non pubblica niente**;
-4. carica i due asset sulla release, sostituendo i precedenti.
+   tiene i suoi dati già compilati — una per ogni lingua da pubblicare. Servono
+   due file soli: `sets.json` e `cards.json`. Nessuna richiesta all'API pubblica,
+   nessuna toolchain Bun da mantenere;
+2. lancia `build_catalog_tcgdex.py` una volta per lingua: tiene solo i campi
+   utili, ricostruisce le immagini mancanti (`--fill-images`) e scrive
+   `dist/catalog[-<lingua>].json.gz` + `dist/manifest[-<lingua>].json`;
+3. confronta il `contentHash` di ciascuna lingua con quello della release già
+   pubblicata: **quello che non è cambiato non viene ripubblicato**, perché
+   ricaricare un asset identico vuol dire far riscaricare decine di MB a chi ce
+   l'ha già uguale;
+4. carica sulla release i soli asset cambiati, sostituendo i precedenti.
+
+Le lingue da generare si scelgono con l'input `langs` del workflow (default
+`en ja`).
 
 Il bundle è riproducibile: a parità di dati in ingresso i byte in uscita sono gli
 stessi (liste ordinate, gzip senza data né nome del file dentro). L'eccezione è
@@ -75,8 +96,9 @@ Per ogni espansione: `id`, `name`, `series`, `printedTotal`, `total`,
 `ptcgoCode`, `releaseDate`, `symbol`, `logo`.
 
 Per ogni carta: `id`, `set`, `name`, `number`, `rarity`, `supertype`, `types`,
-`img`, `imgHi`, `hp`, `regulationMark`, `illustrator`, `stage`. Niente attacchi,
-testi o abilità: non si leggono da una fotografia e peserebbero moltissimo.
+`img`, `imgHi`, `hp`, `regulationMark`, `illustrator`, `stage`, e — solo dove
+serve — `names`. Niente attacchi, testi o abilità: non si leggono da una
+fotografia e peserebbero moltissimo.
 
 I quattro campi in fondo sono lì per un motivo solo: sono **stampati sulla
 carta**, quindi l'OCR può leggerli e usarli per distinguere due carte che
@@ -86,6 +108,39 @@ alle statistiche dell'app, che dividono la collezione per tipo; è una lista
 perché qualche carta ne ha più d'uno, ed è `null` per Allenatori ed Energie, che
 un tipo non ce l'hanno.
 
+### I nomi nelle altre lingue
+
+Il catalogo è in inglese, ma le carte in mano a chi usa l'app spesso no. Una
+carta italiana si chiama `Cyndaquil di Armonio` dove il catalogo dice
+`Ethan's Cyndaquil`: due stringhe che non si somigliano affatto, ed è il caso
+peggiore per il riconoscimento, perché il nome è metà del punteggio con cui
+l'app sceglie la carta.
+
+`--names it` aggiunge quindi al catalogo occidentale i nomi presi dalla cartella
+`generated/it`, agganciati per **id della carta** — che in TCGdex è lo stesso in
+tutte le lingue occidentali:
+
+```json
+"names": {"it": "Cyndaquil di Armonio"}
+```
+
+Due regole, tutte e due per il peso:
+
+- il nome c'è **solo se è diverso** da quello inglese. Su un campione di 2.358
+  carte prese da undici espansioni di ogni epoca, a differire è circa **un terzo**
+  — quasi tutti Allenatori, Energie e carte intestate a un personaggio, cioè
+  proprio quelle che il riconoscimento sbaglia;
+- la chiave manca del tutto quando non c'è niente da dire, invece di portare
+  `null` come fanno gli altri campi: sarebbe nulla per due carte su tre.
+
+Non è una traduzione del catalogo e non cambia cosa si legge nell'app: il nome
+mostrato resta quello inglese. Serve al confronto con quello che l'OCR legge
+sulla carta.
+
+Le lingue senza dati non fanno danno: dove i nomi mancano — l'era EX, per dire,
+in italiano non è tradotta — la carta resta con il solo nome inglese, che è
+esattamente com'era prima. Il run stampa la copertura, ed è lì che si vede.
+
 ### Lo schema
 
 | schema | cosa aggiunge |
@@ -93,6 +148,7 @@ un tipo non ce l'hanno.
 | 1 | il bundle originale, generato da pokemon-tcg-data |
 | 2 | `hp`, `regulationMark`, `illustrator`, `stage` |
 | 3 | `types` |
+| 4 | `names`, i nomi nelle altre lingue |
 
 L'app dichiara un **intervallo** di schemi accettati, non un numero solo: un
 bundle di schema precedente si importa lo stesso, semplicemente senza i campi
@@ -100,19 +156,34 @@ nuovi. Quindi non conta l'ordine fra il run di questa action e l'aggiornamento
 dell'app — conta solo non pubblicare mai uno schema **più alto** di quello che
 l'app conosce, perché quello viene rifiutato.
 
+Ed è il motivo per cui l'action ha l'interruttore `publish`: quando qui si alza
+lo schema, il bundle nuovo si vuole prima **misurare** e solo dopo mettere
+online. Finché l'app che lo capisce non è in giro, il modo sicuro è tenere le
+modifiche su un ramo e lanciare l'action da lì con la spunta tolta: il giro
+settimanale parte solo dal ramo principale, quindi da un ramo non può
+pubblicare per sbaglio.
+
 ## Lanciarlo in locale
 
 Serve Python 3 e la cartella `generated/<lingua>` di TCGdex (o i due file
 `sets.json` e `cards.json` presi da lì):
 
 ```bash
-python build_catalog_tcgdex.py --source ./source --output ./dist --lang en --fill-images
+# I nomi italiani si prendono da source/it/cards.json, cioè dalla cartella
+# sorella di quella che si sta generando.
+python build_catalog_tcgdex.py --source ./source/en --output ./dist --lang en --fill-images --names it
+# e, per il catalogo giapponese, i dati di generated/ja/ nella loro cartella:
+python build_catalog_tcgdex.py --source ./source/ja --output ./dist --lang ja --fill-images
 ```
 
 Alla fine stampa i numeri che vale la pena guardare a ogni run: quante carte sono
 senza immagine, quanti set sono senza totale stampato, la copertura dei campi che
-servono al riconoscimento e quante carte hanno almeno un tipo. Se una di queste
-percentuali crolla, è la sorgente che è cambiata.
+servono al riconoscimento, quante carte hanno almeno un tipo e — per ogni lingua
+di `--names` — quante carte hanno un nome tradotto, quante ce l'hanno diverso
+dall'inglese e quanto pesano compressi. Se una di queste percentuali crolla, è la
+sorgente che è cambiata; se la copertura di una lingua va a **zero**, gli id di
+quella lingua non corrispondono più a quelli inglesi ed è il caso di fermarsi
+prima di pubblicare.
 
 ## Immagini mancanti
 
