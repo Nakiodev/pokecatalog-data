@@ -1,158 +1,290 @@
-name: build-catalog-tcgdex
+name: inspect-tcgdex
 
-# Gemello di build-catalog.yml, ma con i dati di TCGdex e su un tag SEPARATO.
-# Finche' resta cosi', la release "catalog" che l'app usa davvero non viene
-# toccata: si puo' generare, scaricare e confrontare il bundle nuovo senza
-# rischiare di rompere le installazioni esistenti.
+# Workflow USA-E-GETTA. Guarda cosa c'e' dentro l'immagine ufficiale di TCGdex
+# (tcgdex/server) per decidere cosa possiamo ricavarne.
 #
-#   https://github.com/<owner>/<repo>/releases/download/catalog-tcgdex/manifest.json
-#   https://github.com/<owner>/<repo>/releases/download/catalog-tcgdex/catalog.json.gz
+# Non genera bundle, non tocca nessuna release, non pubblica niente: scrive solo
+# nel log e in un artifact temporaneo. Da cancellare quando ha finito il suo
+# lavoro.
 #
-# Sulla stessa release convivono i cataloghi di piu' lingue, uno per asset:
-# l'inglese senza suffisso (e' quello che le app gia' installate cercano), le
-# altre con il codice lingua in coda.
+# Il primo giro rispose alle domande sul catalogo: l'albero compilato sta in
+#   usr/src/app/generated/<lingua>/{cards,sets,series,stats}.json
+# e cards.json contiene le carte COMPLETE (con `rarity` e `category`, che l'API
+# pubblica nelle liste non espone). Su quello e' costruita la pipeline.
 #
-#   manifest-ja.json / catalog-ja.json.gz   ->  carte giapponesi
+# QUESTO giro serve a un'altra domanda: **i prezzi**. Sappiamo che l'API di
+# TCGdex serve `pricing.cardmarket` (euro, avg/low/trend, per singola variante),
+# ma che quel campo non e' nel dump compilato: lo aggiunge il server quando
+# risponde. Prima di progettare qualsiasi cosa servono quattro risposte:
 #
-# Non sono traduzioni l'uno dell'altro: le carte giapponesi escono in espansioni
-# loro e numerate a modo loro, quindi l'app li tiene in due database separati e
-# scarica il secondo solo a chi lo chiede.
+#   1. dentro l'immagine c'e' un file di prezzi?
+#   2. il server, avviato in locale, risponde con `pricing`?
+#   3. lo fa anche SENZA RETE, cioe' i prezzi sono suoi o li va a chiedere?
+#   4. quante carte ne hanno davvero, in inglese e in giapponese?
 #
-# Quando il bundle nuovo convince, il passaggio definitivo e' cambiare TAG qui
-# e in CatalogConfig.kt (e togliere il workflow vecchio).
+# La terza e' quella che decide tutto: se i prezzi sono dentro l'immagine, per
+# averli basta avviare il container dentro questa Action e interrogarlo, senza
+# fare 23.000 richieste al loro server pubblico. Se invece li chiede a qualcun
+# altro, ogni aggiornamento e' traffico su un'infrastruttura che non e' nostra, e
+# va chiesto il permesso prima di scrivere una riga di codice.
+#
+# Nota: niente `pipefail` in questi step. Le pipe che finiscono in `head`
+# ricevono SIGPIPE per costruzione, e con pipefail un output troncato di
+# proposito verrebbe letto come errore (era il motivo del run rosso).
 on:
   workflow_dispatch:
     inputs:
       image:
-        description: "Immagine TCGdex da cui prendere i dati"
+        description: "Immagine da ispezionare"
         default: "tcgdex/server:edge"
       langs:
-        description: "Lingue da generare, separate da spazio"
+        description: "Lingue da campionare, separate da spazio"
         default: "en ja"
-  schedule:
-    # Ogni lunedi' alle 05:30 UTC, mezz'ora dopo il workflow storico cosi' i
-    # due non si contendono il runner.
-    - cron: "30 5 * * 1"
-
-permissions:
-  contents: write
 
 env:
-  TAG: catalog-tcgdex
-  # Tutte le lingue pubblicate: il giro settimanale le rigenera tutte, perche' un
-  # catalogo giapponese fermo a sei mesi fa e' un problema di chi lo ha scaricato
-  # esattamente quanto lo sarebbe quello occidentale.
+  IMAGE: ${{ inputs.image || 'tcgdex/server:edge' }}
   LANGS: ${{ inputs.langs || 'en ja' }}
+  # Quante carte per lingua si interrogano per stimare la copertura dei prezzi.
+  # E' un campione, non un censimento: chiederle tutte sarebbe esattamente il
+  # traffico che stiamo cercando di evitare.
+  SAMPLE: "20"
 
 jobs:
-  build:
+  inspect:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout di questo repo
-        uses: actions/checkout@v4
-
-      # I dati sono gia' compilati dentro l'immagine (il loro build.yml esegue
-      # `bun run compile` prima del docker build), quindi non serve avviare il
-      # server ne' interrogare l'API pubblica: si estrae la cartella e basta.
-      - name: Estrai i dati da TCGdex
-        env:
-          IMAGE: ${{ inputs.image || 'tcgdex/server:edge' }}
+      - name: Scarica le immagini
         run: |
           set -eu
           docker pull "$IMAGE"
-          echo "digest: $(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE")"
+          echo "== digest (da pinnare se adottiamo questa strada) =="
+          docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE"
+          # Serve piu' avanti per interrogare il server da dentro una rete
+          # isolata, dove il runner non arriva. Si scarica adesso, finche' la
+          # rete c'e'.
+          docker pull curlimages/curl:latest
 
+      # `docker export` invece di entrare nel container: non serve che
+      # l'immagine contenga una shell.
+      - name: Estrai l'albero generato
+        run: |
+          set -eu
           cid=$(docker create "$IMAGE")
           docker export "$cid" -o image.tar
           docker rm "$cid" >/dev/null
 
-          # Percorso noto ma non garantito dal progetto TCGdex: se un giorno lo
-          # spostano vogliamo un errore chiaro qui, non un bundle vuoto pubblicato.
+          # Il listato va su file: cosi' grep/head lavorano su un file e non
+          # su una pipe che qualcuno chiude in anticipo.
           tar -tf image.tar > listing.txt
           root=$(grep -E '(^|/)generated/$' listing.txt | head -n 1)
           if [ -z "$root" ]; then
             echo "::error::Nessuna cartella 'generated' nell'immagine $IMAGE."
-            echo "::error::I dati non sono piu' precompilati: serve il fallback"
-            echo "::error::con checkout di tcgdex/cards-database e 'bun run compile'."
             exit 1
           fi
           root="${root%/}"
+          echo "ROOT=$root" >> "$GITHUB_ENV"
 
-          # Ogni lingua nella sua cartella: i due file si chiamano uguale, e in
-          # una cartella sola il secondo cancellerebbe il primo.
           for lang in $LANGS; do
-            if ! tar -xf image.tar --wildcards "$root/$lang/*"; then
-              echo "::error::Lingua '$lang' assente dall'immagine $IMAGE."
-              exit 1
-            fi
-            mkdir -p "source/$lang"
-            cp "$root/$lang/sets.json" "$root/$lang/cards.json" "source/$lang/"
+            tar -xf image.tar --wildcards "$root/$lang/*"
+            echo "== file di $lang =="
+            ls -la "$root/$lang"
           done
-          rm -f image.tar
-          ls -la source/*
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      # --fill-images cerca sul CDN le immagini che i dati non dichiarano: sono
-      # ~1.700 richieste HEAD per lingua, un paio di minuti. Senza, quelle carte
-      # restano senza anteprima anche quando il file esiste.
-      - name: Genera i bundle
+      # DOMANDA 1: c'e' un file di prezzi dentro l'immagine?
+      #
+      # Si guarda in due modi, perche' uno solo mente facilmente: il nome dei
+      # file (un `pricing.json` si riconoscerebbe subito) e il contenuto di
+      # quelli che gia' estraiamo (se `pricing` comparisse dentro cards.json,
+      # tutto il resto di questo workflow sarebbe inutile e avremmo finito).
+      - name: I prezzi sono dentro l'immagine?
         run: |
           set -eu
-          for lang in $LANGS; do
-            echo "::group::$lang"
-            python build_catalog_tcgdex.py \
-              --source "source/$lang" --output dist \
-              --lang "$lang" --fill-images
-            echo "::endgroup::"
-          done
-          ls -la dist
+          echo "== file col nome sospetto =="
+          # In un `grep | head` l'esito e' quello di head, cioe' sempre zero: per
+          # distinguere "nessun file" da "nessun output" il filtro va fatto
+          # prima, su un file suo.
+          if grep -iE 'pric|cardmarket|tcgplayer|quotation|market' listing.txt > sospetti.txt; then
+            head -n 40 sospetti.txt
+          else
+            echo "  nessuno"
+          fi
 
-      # Il confronto e la pubblicazione sono per lingua: un catalogo puo' essere
-      # cambiato e l'altro no, e ripubblicare un asset identico vorrebbe dire
-      # far riscaricare decine di MB a chi ce l'ha gia' uguale.
-      - name: Pubblica gli asset cambiati
-        env:
-          GH_TOKEN: ${{ github.token }}
+          for lang in $LANGS; do
+            cards="$ROOT/$lang/cards.json"
+            [ -f "$cards" ] || continue
+            echo "== $lang: occorrenze dentro cards.json =="
+            for needle in pricing cardmarket tcgplayer; do
+              n=$(grep -o "\"$needle\"" "$cards" | wc -l || true)
+              echo "  \"$needle\": $n"
+            done
+          done
+
+      # DOMANDA 4 (prima parte): che campi hanno davvero le carte, per lingua.
+      # E' lo stesso conteggio del primo giro, ma ora su piu' lingue: serve a
+      # sapere se il catalogo giapponese e' completo quanto l'altro.
+      - name: Campi presenti, per lingua
         run: |
-          set -euo pipefail
-          hash_of() {
-            python -c "import json,sys;print(json.load(open(sys.argv[1]))['contentHash'])" "$1"
-          }
+          set -eu
+          mkdir -p samples
+          python3 - <<'PY'
+          import collections, json, os
 
-          to_upload=""
-          for lang in $LANGS; do
-            if [ "$lang" = "en" ]; then suffix=""; else suffix="-$lang"; fi
-            manifest="manifest${suffix}.json"
-            bundle="catalog${suffix}.json.gz"
+          root = os.environ["ROOT"]
+          langs = os.environ["LANGS"].split()
+          scelte = {}
 
-            new_hash=$(hash_of "dist/$manifest")
-            old_hash=""
-            rm -rf current
-            if gh release download "$TAG" --pattern "$manifest" --dir current 2>/dev/null; then
-              old_hash=$(hash_of "current/$manifest")
+          for lang in langs:
+              base = os.path.join(root, lang)
+              with open(os.path.join(base, "cards.json"), encoding="utf-8") as f:
+                  cards = json.load(f)
+              print(f"\n== {lang}: {len(cards)} carte ==")
+              freq = collections.Counter(k for c in cards for k in c)
+              for k, n in freq.most_common():
+                  print(f"  {k}: {n} ({n * 100 // max(len(cards), 1)}%)")
+
+              # Le carte da interrogare dopo: si prendono dalle serie recenti,
+              # che sono quelle che un prezzo ce l'hanno di sicuro. Se non se ne
+              # riconoscono, si ripiega sulle prime che capitano.
+              recenti = [c["id"] for c in cards if str(c.get("id", "")).startswith(("sv", "me"))]
+              scelte[lang] = (recenti or [c["id"] for c in cards])[: int(os.environ["SAMPLE"])]
+              print(f"  campione per le richieste: {len(scelte[lang])} carte")
+
+              with open(f"samples/cards-{lang}-primi-50.json", "w", encoding="utf-8") as f:
+                  json.dump(cards[:50], f, ensure_ascii=False, indent=2)
+
+          with open("samples/campione-id.json", "w", encoding="utf-8") as f:
+              json.dump(scelte, f, ensure_ascii=False, indent=2)
+          PY
+
+      # DOMANDE 2 e 4: avviato il server, risponde con i prezzi? e per quante
+      # carte?
+      #
+      # Se il container non parte non e' un fallimento del workflow ma una
+      # risposta: vuol dire che quella strada richiede piu' di un `docker run`
+      # (una configurazione, un database), e va saputo adesso. Per questo il log
+      # del container si stampa comunque.
+      - name: Il server risponde con i prezzi? (con rete)
+        run: |
+          set -eu
+          port=$(docker image inspect --format '{{json .Config.ExposedPorts}}' "$IMAGE" \
+            | tr -d '{}"' | tr ',' '\n' | head -n 1 | cut -d/ -f1)
+          port=${port:-3000}
+          echo "porta esposta dall'immagine: $port"
+          echo "PORT=$port" >> "$GITHUB_ENV"
+
+          docker rm -f tcgdex >/dev/null 2>&1 || true
+          docker run -d --name tcgdex -p 3000:"$port" "$IMAGE" >/dev/null
+
+          pronto=""
+          for _ in $(seq 1 30); do
+            if curl -fsS "http://localhost:3000/v2/en/sets" -o /dev/null 2>/dev/null; then
+              pronto="si"
+              break
             fi
-
-            if [ "$new_hash" = "$old_hash" ]; then
-              echo "$lang: dati invariati (hash $new_hash), non si pubblica."
-            else
-              echo "$lang: dati cambiati ($old_hash -> $new_hash)."
-              to_upload="$to_upload dist/$bundle dist/$manifest"
-            fi
+            sleep 2
           done
 
-          if [ -z "$to_upload" ]; then
-            echo "Niente da pubblicare."
+          echo "== log del container =="
+          docker logs tcgdex 2>&1 | tail -n 30 || true
+
+          if [ -z "$pronto" ]; then
+            echo "::warning::Il server non risponde su /v2/en/sets: la strada"
+            echo "::warning::'avvia il container e interrogalo' richiede altro."
             exit 0
           fi
 
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" \
-              --title "Catalogo carte (TCGdex, in prova)" \
-              --prerelease \
-              --notes "Bundle generato da build-catalog-tcgdex a partire dai dati TCGdex. Tag separato da 'catalog': serve a confrontare le due sorgenti prima di passare l'app alla nuova."
+          python3 - <<'PY'
+          import json, os, urllib.request
+
+          scelte = json.load(open("samples/campione-id.json", encoding="utf-8"))
+          risultati = {}
+
+          for lang, ids in scelte.items():
+              con_prezzo = 0
+              primo = None
+              for card_id in ids:
+                  url = f"http://localhost:3000/v2/{lang}/cards/{card_id}"
+                  try:
+                      with urllib.request.urlopen(url, timeout=20) as r:
+                          carta = json.load(r)
+                  except Exception as e:
+                      print(f"  {lang}/{card_id}: richiesta fallita ({e})")
+                      continue
+                  pricing = carta.get("pricing")
+                  if pricing:
+                      con_prezzo += 1
+                      if primo is None:
+                          primo = {"id": card_id, "pricing": pricing}
+              totale = len(ids)
+              risultati[lang] = {"campione": totale, "con_prezzo": con_prezzo, "esempio": primo}
+              print(f"\n== {lang}: {con_prezzo} carte su {totale} hanno `pricing` ==")
+              if primo:
+                  print(json.dumps(primo, ensure_ascii=False, indent=2))
+              else:
+                  print("  nessun prezzo in questo campione")
+
+          json.dump(risultati, open("samples/prezzi.json", "w", encoding="utf-8"),
+                    ensure_ascii=False, indent=2)
+          PY
+
+          docker rm -f tcgdex >/dev/null
+
+      # DOMANDA 3, quella che decide tutto: i prezzi sono dentro l'immagine o il
+      # server li va a chiedere a qualcun altro?
+      #
+      # Il container gira su una rete `--internal`, che non ha uscita verso
+      # Internet, e lo si interroga da un secondo container attaccato alla stessa
+      # rete — dal runner non sarebbe raggiungibile. Se `pricing` c'e' lo stesso,
+      # i prezzi viaggiano dentro l'immagine e ci bastano un `docker run` e
+      # qualche richiesta in locale. Se sparisce, ogni aggiornamento e' traffico
+      # sull'infrastruttura di qualcun altro.
+      - name: Il server risponde con i prezzi anche senza rete?
+        run: |
+          set -eu
+          docker network rm isolata >/dev/null 2>&1 || true
+          docker network create --internal isolata >/dev/null
+
+          docker rm -f tcgdex-isolato >/dev/null 2>&1 || true
+          docker run -d --name tcgdex-isolato --network isolata "$IMAGE" >/dev/null
+          sleep 20
+
+          # La prima lingua che ha prodotto un campione, non per forza l'inglese:
+          # il workflow si puo' lanciare anche solo su una lingua.
+          card=$(python3 -c "import json;d=json.load(open('samples/campione-id.json'));print(next(i[0] for i in d.values() if i))")
+          echo "carta di prova: $card"
+
+          set +e
+          docker run --rm --network isolata curlimages/curl:latest \
+            -sS --max-time 30 "http://tcgdex-isolato:${PORT}/v2/en/cards/$card" > isolato.json
+          esito=$?
+          set -e
+
+          echo "== log del container isolato =="
+          docker logs tcgdex-isolato 2>&1 | tail -n 30 || true
+
+          if [ "$esito" -ne 0 ] || [ ! -s isolato.json ]; then
+            echo "::warning::Senza rete il server non ha risposto affatto: la"
+            echo "::warning::risposta a questa domanda non e' concludente."
+          else
+            echo "== risposta senza rete (primi 1500 caratteri) =="
+            head -c 1500 isolato.json
+            echo
+            if grep -q '"pricing"' isolato.json; then
+              echo "== VERDETTO: i prezzi sono DENTRO l'immagine =="
+            else
+              echo "== VERDETTO: senza rete il campo pricing non c'e' =="
+              echo "   quindi il server li chiede a qualcun altro."
+            fi
+            cp isolato.json samples/carta-senza-rete.json
           fi
-          # shellcheck disable=SC2086
-          gh release upload "$TAG" $to_upload --clobber
+
+          docker rm -f tcgdex-isolato >/dev/null
+          docker network rm isolata >/dev/null
+
+      - name: Carica i campioni
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tcgdex-samples
+          path: samples/
+          retention-days: 7
