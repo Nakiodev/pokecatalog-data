@@ -26,10 +26,18 @@ loro e numerate a modo loro, quindi sono cataloghi distinti anche come dati.
 L'inglese tiene i nomi senza suffisso perche' sono quelli che le versioni
 dell'app gia' installate vanno a cercare.
 
-Al catalogo occidentale si aggiungono i **nomi delle carte nelle altre lingue**
-(`--names it`), presi dalle stesse cartelle. Non e' un'altra traduzione del
-catalogo: sono le stesse carte, e il nome in piu' serve solo a riconoscerle
-quando la copia in mano non e' in inglese. Vedi `load_names`.
+Al catalogo occidentale si aggiungono **nome e illustrazione delle carte nelle
+altre lingue** (`--names it`), presi dalle stesse cartelle. Non e' un'altra
+traduzione del catalogo: sono le stesse carte: il nome serve a riconoscerle
+quando la copia in mano non e' in inglese, l'illustrazione a mostrare la carta
+com'e' stampata davvero. Vedi `load_translations` e `image_langs`.
+
+I nomi stanno nei dati; le illustrazioni no, e vanno chieste al CDN. Con
+`--names` **e** `--fill-images` il generatore fa quindi un secondo giro di
+richieste — una per carta e per lingua, tutto il catalogo, non solo le carte
+senza immagine — per sapere quali hanno una scansione italiana. Vedi
+`fill_image_langs`: e' il giro piu' lungo di tutto il build, e quanto duri lo
+decide `--workers`.
 
 Uso:
     python build_catalog_tcgdex.py --source ./source/en --output ./dist --names it
@@ -54,8 +62,8 @@ from pathlib import Path
 # dati (campi aggiunti/rinominati): l'app rifiuta gli schemi che non conosce.
 # Passare a TCGdex di per se' cambia i VALORI (gli id), non la forma; la 2
 # arriva dai quattro campi in piu' per il riconoscimento (vedi slim_card), la 3
-# dai tipi della carta (Fuoco, Acqua...), che servono alle statistiche, la 4 dai
-# nomi nelle altre lingue (vedi --names).
+# dai tipi della carta (Fuoco, Acqua...), che servono alle statistiche, la 4 da
+# nomi e illustrazioni nelle altre lingue (vedi --names).
 SCHEMA_VERSION = 4
 
 # La lingua che tiene i nomi storici degli asset ("catalog.json.gz",
@@ -277,34 +285,145 @@ def card_types(raw: dict) -> list[str] | None:
 #
 # Il catalogo giapponese non c'entra: quelle carte sono stampate in giapponese e
 # il loro nome ce l'hanno gia'.
-def load_names(source: Path, langs: list[str]) -> dict[str, dict[str, str]]:
-    """Per ogni lingua, i nomi delle carte per id: {"it": {"sv10-032": "..."}}."""
-    names: dict[str, dict[str, str]] = {}
+def load_translations(source: Path, langs: list[str]) -> dict[str, dict[str, dict]]:
+    """Per ogni lingua, nome e immagine delle carte per id.
+
+    {"it": {"sv10-032": {"name": "Cyndaquil di Armonio", "image": "https://..."}}}
+    """
+    translations: dict[str, dict[str, dict]] = {}
     for lang in langs:
         cards_file = source / lang / "cards.json"
         if not cards_file.is_file():
-            sys.exit(f"Nomi in '{lang}': file non trovato ({cards_file})")
+            sys.exit(f"Lingua '{lang}': file non trovato ({cards_file})")
         raw = json.loads(cards_file.read_text(encoding="utf-8"))
-        names[lang] = {
-            c["id"]: c["name"]
+        translations[lang] = {
+            c["id"]: {"name": c.get("name"), "image": c.get("image")}
             for c in raw
-            if c.get("id") and c.get("name")
+            if c.get("id")
         }
-    return names
+    return translations
 
 
 def other_names(
     card_id: str,
     english: str,
-    names: dict[str, dict[str, str]],
+    translations: dict[str, dict[str, dict]],
 ) -> dict[str, str] | None:
     """I nomi diversi da quello inglese, per lingua, o None se non ce ne sono."""
     kept = {
         lang: nome
-        for lang, per_id in names.items()
-        if (nome := per_id.get(card_id)) and nome != english
+        for lang, per_id in translations.items()
+        if (nome := (per_id.get(card_id) or {}).get("name")) and nome != english
     }
     return kept or None
+
+
+# --- L'illustrazione nella lingua della carta ------------------------------
+#
+# Una carta italiana e' *stampata* in italiano: il nome sull'illustrazione, il
+# testo, il riquadro degli attacchi. Mostrare la scansione inglese a chi ha in
+# mano quella italiana e' come mostrare un'altra carta, e il CDN di TCGdex le ha
+# tutte e due — cambia un solo segmento dell'URL:
+#
+#   https://assets.tcgdex.net/en/sv/sv10/032   ->   .../it/sv/sv10/032
+#
+# Nel bundle non finiscono quindi due URL per carta, che sarebbero un megabyte e
+# mezzo di stringhe quasi identiche: resta l'URL di sempre piu' l'elenco delle
+# **altre** lingue che hanno una scansione loro. L'app fa lo scambio del segmento,
+# che e' una regola sola e vale per tutte.
+#
+# Quando l'inglese non ce l'ha e un'altra lingua si', e' quell'altra a finire
+# nell'URL: e' l'unica immagine che esiste, e mostrarla e' meglio del segnaposto.
+# Per questo la lingua dell'URL non si da' per scontata da nessuna parte.
+def image_langs(
+    card_id: str,
+    chosen: str,
+    translations: dict[str, dict[str, dict]],
+) -> list[str] | None:
+    """Le altre lingue con una scansione propria, esclusa quella gia' in `img`.
+
+    Guarda quello che i dati *dichiarano*. Oggi non dichiarano niente: nel
+    `cards.json` italiano estratto dall'immagine di TCGdex il campo `image` non
+    c'e' per nessuna carta, mentre il nome c'e' per migliaia. Il bundle usciva
+    quindi senza nemmeno un `imgLangs`, e l'app — che scambia il segmento della
+    lingua solo per le lingue dichiarate — mostrava l'illustrazione inglese anche
+    a chi legge l'app in italiano.
+
+    Le scansioni pero' esistono: `assets.tcgdex.net/it/me/me05/001/low.png`
+    risponde. A trovarle ci pensa [fill_image_langs], che le chiede al CDN come
+    gia' si fa per le immagini mancanti. Questa funzione resta perche' e' la
+    strada buona — se un giorno i dati le dichiarassero, non servirebbe chiedere
+    niente a nessuno.
+    """
+    kept = sorted(
+        lang
+        for lang, per_id in translations.items()
+        if lang != chosen and (per_id.get(card_id) or {}).get("image")
+    )
+    return kept or None
+
+
+def fill_image_langs(
+    cards: list[dict],
+    series_by_set: dict[str, str],
+    langs: list[str],
+    chosen: str,
+    workers: int,
+) -> dict[str, int]:
+    """Chiede al CDN quali carte hanno una scansione nelle altre lingue.
+
+    Una richiesta per carta e per lingua, che e' molto piu' del giro di
+    [fill_missing_images] — quello prova solo le carte che un'immagine non ce
+    l'hanno affatto, qui si prova tutto il catalogo. E' il prezzo per sapere una
+    cosa che i dati non dicono, e la copertura non e' indovinabile: le espansioni
+    recenti hanno la scansione italiana, il Set Base del 1999 no. Con `--workers`
+    si decide quanto in fretta.
+
+    Quando la carta un'immagine non ce l'ha in nessuna lingua e questa esiste, e'
+    questa a diventare la sua: l'unica scansione che c'e' e' meglio del
+    segnaposto, ed e' il motivo per cui la lingua di `img` non si da' per
+    scontata da nessuna parte.
+
+    Torna quante carte ha trovato per lingua: e' il numero da guardare nel log
+    quando la copertura cambia.
+    """
+    others = [lang for lang in langs if lang != chosen]
+    if not others:
+        return {}
+
+    candidates = [
+        (
+            card,
+            lang,
+            f"{CDN}/{lang}/{series_by_set.get(card['set'], '')}/{card['set']}/{card['number']}",
+        )
+        for lang in others
+        for card in cards
+        if series_by_set.get(card["set"])
+        and card["number"]
+        and lang not in (card.get("imgLangs") or [])
+    ]
+
+    print(
+        f"verifico sul CDN {len(candidates)} illustrazioni nelle lingue "
+        f"{', '.join(others)}..."
+    )
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        hits = list(pool.map(lambda triple: exists(triple[2] + IMG_LARGE_SUFFIX), candidates))
+
+    found = {lang: 0 for lang in others}
+    for (card, lang, base), trovata in zip(candidates, hits):
+        if not trovata:
+            continue
+        found[lang] += 1
+        if not card["img"]:
+            # L'unica scansione che esiste diventa quella della carta, e la sua
+            # lingua non va fra le "altre": e' gia' quella dell'URL.
+            card["img"], card["imgHi"] = card_images(base)
+            continue
+        card["imgLangs"] = sorted({*(card.get("imgLangs") or []), lang})
+    return found
 
 
 def printed_rarity(raw: str | None) -> str | None:
@@ -314,10 +433,28 @@ def printed_rarity(raw: str | None) -> str | None:
     return raw
 
 
-def slim_card(raw: dict, names: dict[str, dict[str, str]] | None = None) -> dict:
-    small, large = card_images(raw.get("image"))
+def slim_card(
+    raw: dict,
+    lang: str = DEFAULT_LANG,
+    translations: dict[str, dict[str, dict]] | None = None,
+) -> dict:
     hp = raw.get("hp")
     english = raw.get("name") or ""
+
+    # L'illustrazione: quella della lingua che si sta generando, e se non c'e'
+    # la prima delle altre che ce l'ha. La lingua scelta si porta dietro se'
+    # stessa, perche' da li' in poi tutto — l'elenco delle altre lingue, lo
+    # scambio che fara' l'app — si misura sull'URL che e' finito nel bundle.
+    base = raw.get("image")
+    chosen = lang
+    if not base and translations:
+        for other, per_id in sorted(translations.items()):
+            candidate = (per_id.get(raw["id"]) or {}).get("image")
+            if candidate:
+                base, chosen = candidate, other
+                break
+    small, large = card_images(base)
+
     card = {
         "id": raw["id"],
         "set": (raw.get("set") or {}).get("id") or "",
@@ -345,15 +482,18 @@ def slim_card(raw: dict, names: dict[str, dict[str, str]] | None = None) -> dict
         "stage": raw.get("stage"),
     }
 
-    # La chiave dei nomi c'e' **solo quando ha qualcosa dentro**, al contrario di
-    # tutte le altre che portano null quando il dato manca. La differenza e' che
-    # queste sarebbero nulle quasi sempre: ventitremila "names":null sono un
-    # terzo di megabyte di niente, e l'assenza della chiave l'app la legge
-    # esattamente come la legge nulla.
-    if names:
-        altri = other_names(card["id"], english, names)
+    # Le due chiavi delle altre lingue ci sono **solo quando hanno qualcosa
+    # dentro**, al contrario di tutte le altre che portano null quando il dato
+    # manca. La differenza e' che queste sarebbero nulle quasi sempre:
+    # ventitremila `"names":null` sono un terzo di megabyte di niente, e
+    # l'assenza della chiave l'app la legge esattamente come la legge nulla.
+    if translations:
+        altri = other_names(card["id"], english, translations)
         if altri:
             card["names"] = altri
+        lingue = image_langs(card["id"], chosen, translations)
+        if lingue:
+            card["imgLangs"] = lingue
     return card
 
 
@@ -402,16 +542,18 @@ def build(
     # MB, che stanno in memoria senza problemi sul runner.
     raw_cards = json.loads(cards_file.read_text(encoding="utf-8"))
 
-    # I nomi nelle altre lingue stanno in cartelle sorelle di quella che si sta
-    # generando: `source/en` per il catalogo, `source/it` per i nomi italiani.
-    names = (
-        load_names(names_source or source.parent, name_langs) if name_langs else {}
+    # Le altre lingue stanno in cartelle sorelle di quella che si sta generando:
+    # `source/en` per il catalogo, `source/it` per nomi e illustrazioni italiane.
+    translations = (
+        load_translations(names_source or source.parent, name_langs)
+        if name_langs
+        else {}
     )
 
     cards: list[dict] = []
     orphans: set[str] = set()
     for raw in raw_cards:
-        card = slim_card(raw, names)
+        card = slim_card(raw, lang, translations)
         if card["set"] not in known_set_ids:
             # Carta che punta a un set assente dall'indice: senza i conteggi del
             # set non e' utilizzabile per il matching, quindi la saltiamo.
@@ -433,6 +575,17 @@ def build(
             f"immagini recuperate dal CDN -> carte: {len(recuperate)}, "
             f"simboli/loghi: {recuperati_set}"
         )
+
+        # Dopo, non prima: il giro qui sopra puo' aver dato un'immagine a una
+        # carta che non ne aveva, e da li' in poi la domanda su questa carta
+        # cambia — non "quale scansione esiste" ma "ne esiste anche un'altra".
+        if name_langs:
+            per_lingua = fill_image_langs(cards, series_by_set, name_langs, lang, workers)
+            if per_lingua:
+                print(
+                    "illustrazioni trovate per lingua -> "
+                    + ", ".join(f"{k}: {v}" for k, v in sorted(per_lingua.items()))
+                )
 
     catalog = {
         "schema": SCHEMA_VERSION,
@@ -521,13 +674,15 @@ def build(
     # l'altra: se TCGdex li numerasse diversamente uscirebbe zero, e quello che
     # si sta per pubblicare sarebbe un catalogo senza nessun nome tradotto. Il
     # secondo e' quello che finisce nel bundle, e spiega il peso qui sopra.
-    for lingua in sorted(names):
-        trovati = sum(1 for c in cards if c["id"] in names[lingua])
+    for lingua in sorted(translations):
+        trovati = sum(1 for c in cards if c["id"] in translations[lingua])
         diversi = sum(1 for c in cards if lingua in (c.get("names") or {}))
+        illustrate = sum(1 for c in cards if lingua in (c.get("imgLangs") or []))
         print(
             f"nomi {lingua}: {trovati}/{len(cards)} carte "
             f"({trovati * 100 / totale:.0f}%), di cui {diversi} diversi "
-            f"dall'inglese ({diversi * 100 / totale:.0f}% del catalogo)"
+            f"dall'inglese ({diversi * 100 / totale:.0f}% del catalogo) | "
+            f"illustrazioni {lingua}: {illustrate} ({illustrate * 100 / totale:.0f}%)"
         )
         if not trovati:
             print(
@@ -535,23 +690,39 @@ def build(
                 f"lingua non corrispondono a quelli inglesi."
             )
 
-    if names:
+    # Le carte la cui unica illustrazione non e' nella lingua del catalogo: e'
+    # il ripiego al contrario, e va detto perche' e' l'unico caso in cui il
+    # bundle porta un URL in una lingua che non e' la sua.
+    if translations:
+        altrui = sum(
+            1
+            for c in cards
+            if c["img"] and f"/{lang}/" not in c["img"]
+        )
+        if altrui:
+            print(
+                f"carte illustrate solo in un'altra lingua: {altrui} "
+                f"({altrui * 100 / totale:.1f}%)"
+            )
+
+    if translations:
         # Quanto costano davvero, compressi: e' l'unico numero che conta per chi
         # scarica, e non si ricava da quello in chiaro. Si ricomprime il
-        # catalogo senza la chiave e si guarda la differenza.
-        senza_nomi = json.dumps(
+        # catalogo senza le due chiavi e si guarda la differenza.
+        senza = json.dumps(
             {
                 **catalog,
                 "cards": [
-                    {k: v for k, v in c.items() if k != "names"} for c in cards
+                    {k: v for k, v in c.items() if k not in ("names", "imgLangs")}
+                    for c in cards
                 ],
             },
             ensure_ascii=False,
             separators=(",", ":"),
         ).encode("utf-8")
-        costo = bundle_bytes - len(gzip.compress(senza_nomi))
+        costo = bundle_bytes - len(gzip.compress(senza))
         print(
-            f"peso dei nomi tradotti: {costo / 1024:+.0f} KB compressi "
+            f"peso delle altre lingue: {costo / 1024:+.0f} KB compressi "
             f"({costo * 100 / max(bundle_bytes - costo, 1):+.1f}%)"
         )
 
@@ -643,9 +814,10 @@ def main() -> None:
         "--names",
         default="",
         help=(
-            "Lingue di cui aggiungere i nomi delle carte, separate da virgola "
-            "(es. 'it'). Servono al riconoscimento delle carte non inglesi: "
-            "vedi load_names. Vuoto = solo i nomi di --lang"
+            "Lingue di cui aggiungere nome e illustrazione delle carte, "
+            "separate da virgola (es. 'it'). Servono a riconoscere e a mostrare "
+            "le carte non inglesi: vedi load_translations. "
+            "Vuoto = solo quello che c'e' in --lang"
         ),
     )
     parser.add_argument(
